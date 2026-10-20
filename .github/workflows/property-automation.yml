@@ -1,0 +1,335 @@
+name: Property Automation
+
+permissions:
+  contents: write
+  issues: write
+
+on:
+  schedule:
+    - cron: '31 15 * * *'
+  workflow_dispatch:
+    inputs:
+      property_numbers:
+        description: '매물번호 목록 (콤마 구분, 미입력 시 예약/자동 조회)'
+        required: false
+        default: ''
+      test_mode:
+        description: '테스트 모드'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+
+jobs:
+  check-schedule:
+    runs-on: ubuntu-latest
+    outputs:
+      has_schedule: ${{ steps.check.outputs.has_schedule }}
+      property_count: ${{ steps.check.outputs.property_count }}
+      properties: ${{ steps.check.outputs.properties }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Check for scheduled properties
+      id: check
+      run: |
+        if [ -f "data/scheduled_properties.json" ]; then
+          echo "has_schedule=true" >> $GITHUB_OUTPUT
+          properties=$(cat data/scheduled_properties.json | jq -r '.properties | join(",")' 2>/dev/null || echo "")
+          count=$(cat data/scheduled_properties.json | jq -r '.total_count' 2>/dev/null || echo "0")
+          echo "properties=${properties}" >> $GITHUB_OUTPUT
+          echo "property_count=${count}" >> $GITHUB_OUTPUT
+        else
+          echo "has_schedule=false" >> $GITHUB_OUTPUT
+          echo "properties=" >> $GITHUB_OUTPUT
+          echo "property_count=0" >> $GITHUB_OUTPUT
+        fi
+
+  automation:
+    needs: check-schedule
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.55.0-noble
+    if: always()
+    outputs:
+      has_failures: ${{ steps.automation_run.outputs.has_failures }}
+      failed_properties: ${{ steps.automation_run.outputs.failed_properties }}
+      success_count: ${{ steps.automation_run.outputs.success_count }}
+      total_count: ${{ steps.automation_run.outputs.total_count }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup environment
+      run: |
+        apt-get update && apt-get install -y curl jq git
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt || pip install playwright==1.55.0
+
+    - name: Determine property numbers
+      id: properties
+      run: |
+        if [ -n "${{ github.event.inputs.property_numbers }}" ]; then
+          echo "properties=${{ github.event.inputs.property_numbers }}" >> $GITHUB_OUTPUT
+          echo "source=manual" >> $GITHUB_OUTPUT
+        elif [ "${{ needs.check-schedule.outputs.has_schedule }}" == "true" ] && [ -n "${{ needs.check-schedule.outputs.properties }}" ]; then
+          echo "properties=${{ needs.check-schedule.outputs.properties }}" >> $GITHUB_OUTPUT
+          echo "source=scheduled" >> $GITHUB_OUTPUT
+        elif [ -n "${{ secrets.PROPERTY_NUMBERS }}" ]; then
+          echo "properties=${{ secrets.PROPERTY_NUMBERS }}" >> $GITHUB_OUTPUT
+          echo "source=secrets" >> $GITHUB_OUTPUT
+        else
+          echo "properties=" >> $GITHUB_OUTPUT
+          echo "source=auto" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Run multi-property automation
+      id: automation_run
+      run: |
+        echo "다중 매물 자동화 실행 시작"
+        echo "지정 매물: ${{ steps.properties.outputs.properties }}"
+        echo "실행 소스: ${{ steps.properties.outputs.source }}"
+        echo "테스트 모드: ${{ github.event.inputs.test_mode || 'false' }}"
+
+        set +e
+        python multi_property_automation.py 2>&1 | tee automation.log
+        exit_code=$?
+        set -e
+
+        echo "script_exit_code=${exit_code}" >> $GITHUB_OUTPUT
+
+        if grep -q "❌ 로그인 실패로 자동화 중단" automation.log; then
+          echo "has_login_failure=true" >> $GITHUB_OUTPUT
+          echo "::error::로그인 실패로 자동화 중단됨"
+          exit 1
+        fi
+
+        if [ ${exit_code} -ne 0 ]; then
+          echo "has_system_error=true" >> $GITHUB_OUTPUT
+          echo "::error::Python 스크립트 실행 실패 (exit code: ${exit_code})"
+          exit 1
+        fi
+
+        if grep -q "❌ 최종 실패:" automation.log; then
+          failed_properties=$(grep "❌ 최종 실패:" automation.log | head -1 | sed 's/.*: //')
+          echo "failed_properties=${failed_properties}" >> $GITHUB_OUTPUT
+          echo "has_failures=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_failures=false" >> $GITHUB_OUTPUT
+        fi
+
+        if grep -q "✅ 최종 성공:" automation.log; then
+          success_count=$(grep "✅ 최종 성공:" automation.log | head -1 | sed 's/.*: //;s/\/.*//')
+          total_count=$(grep "✅ 최종 성공:" automation.log | head -1 | sed 's/.*\///;s/개//')
+          echo "success_count=${success_count}" >> $GITHUB_OUTPUT
+          echo "total_count=${total_count}" >> $GITHUB_OUTPUT
+        fi
+      env:
+        LOGIN_ID: ${{ secrets.LOGIN_ID }}
+        LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+        MEMBER_ID: ${{ secrets.MEMBER_ID }}
+        PROPERTY_NUMBERS: ${{ steps.properties.outputs.properties }}
+        TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+        TZ: Asia/Seoul
+
+    - name: Delete completed schedule
+      if: always() && steps.properties.outputs.source == 'scheduled'
+      run: |
+        if [ -f "data/scheduled_properties.json" ]; then
+          rm data/scheduled_properties.json
+          echo "예약 파일 삭제 완료: scheduled_properties.json"
+        fi
+
+    - name: Create execution log
+      if: always()
+      run: |
+        timestamp=$(date +"%Y%m%d_%H%M%S")
+        mkdir -p results
+        cat > results/execution_${timestamp}.json << EOF
+        {
+          "executed_at": "$(date -Iseconds)",
+          "properties": "${{ steps.properties.outputs.properties }}",
+          "test_mode": "${{ github.event.inputs.test_mode || 'false' }}",
+          "source": "${{ steps.properties.outputs.source }}",
+          "status": "completed"
+        }
+        EOF
+
+    - name: Commit results
+      if: always()
+      run: |
+        git config --global --add safe.directory $GITHUB_WORKSPACE
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
+        git pull --rebase || true
+        git add results/ data/ || true
+        if git diff --staged --quiet; then
+          echo "변경사항 없음"
+        else
+          git commit -m "자동화 실행 완료 $(date +"%Y-%m-%d %H:%M:%S")"
+          for i in 1 2 3; do
+            if git push; then
+              break
+            else
+              sleep 2
+              git pull --rebase || true
+            fi
+          done
+        fi
+
+    - name: Upload screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: automation-screenshots-${{ github.run_number }}
+        path: "*.png"
+        retention-days: 7
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: automation-logs-${{ github.run_number }}
+        path: |
+          *.log
+          results/
+        retention-days: 30
+
+  final-check:
+    needs: [check-schedule, automation]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Check workflow status
+      id: workflow_status
+      run: |
+        if [ "${{ needs.automation.result }}" == "failure" ]; then
+          echo "has_system_error=true" >> $GITHUB_OUTPUT
+          echo "failure_reason=시스템 오류 또는 로그인 실패" >> $GITHUB_OUTPUT
+          exit 1
+        elif [ "${{ needs.automation.result }}" == "cancelled" ]; then
+          echo "has_system_error=true" >> $GITHUB_OUTPUT
+          echo "failure_reason=실행 취소됨" >> $GITHUB_OUTPUT
+          exit 1
+        else
+          if [ "${{ needs.automation.outputs.has_failures }}" == "true" ]; then
+            echo "has_property_failures=true" >> $GITHUB_OUTPUT
+          else
+            echo "정상 완료"
+          fi
+        fi
+
+    - name: Download automation logs for failure details
+      if: always() && steps.workflow_status.outputs.has_property_failures == 'true'
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: automation-logs-${{ github.run_number }}
+        path: ./logs
+
+    - name: Extract failure stage details
+      if: always() && steps.workflow_status.outputs.has_property_failures == 'true'
+      id: extract_stages
+      continue-on-error: true
+      run: |
+        if [ -f "./logs/automation.log" ]; then
+          stage_details=""
+          if grep -q "📋 노출종료 실패:" ./logs/automation.log; then
+            exposure_failed=$(grep "📋 노출종료 실패:" ./logs/automation.log | tail -1 | sed 's/.*📋 노출종료 실패: //')
+            stage_details="${stage_details}\n📋 노출종료 실패: ${exposure_failed}"
+          fi
+          if grep -q "📝 광고 저장됨(결제안됨):" ./logs/automation.log; then
+            saved_failed=$(grep "📝 광고 저장됨(결제안됨):" ./logs/automation.log | tail -1 | sed 's/.*📝 광고 저장됨(결제안됨): //')
+            stage_details="${stage_details}\n📝 광고 저장됨(결제안됨): ${saved_failed}"
+          fi
+          if grep -q "💰 충전금 부족:" ./logs/automation.log; then
+            insufficient_failed=$(grep "💰 충전금 부족:" ./logs/automation.log | tail -1 | sed 's/.*💰 충전금 부족: //')
+            stage_details="${stage_details}\n💰 충전금 부족: ${insufficient_failed}"
+          fi
+          if grep -q "💳 결제 실패:" ./logs/automation.log; then
+            payment_failed=$(grep "💳 결제 실패:" ./logs/automation.log | tail -1 | sed 's/.*💳 결제 실패: //')
+            stage_details="${stage_details}\n💳 결제 실패: ${payment_failed}"
+          fi
+          echo "stage_details<<EOF" >> $GITHUB_OUTPUT
+          echo -e "${stage_details}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        else
+          echo "stage_details=로그 파일 없음" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create issue on property failures
+      if: always() && steps.workflow_status.outputs.has_property_failures == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const failedProperties = '${{ needs.automation.outputs.failed_properties }}' || '없음';
+          const successCount = '${{ needs.automation.outputs.success_count }}' || '0';
+          const totalCount = '${{ needs.automation.outputs.total_count }}' || '0';
+          const failedCount = totalCount - successCount;
+          const stageDetails = `${{ steps.extract_stages.outputs.stage_details }}` || '상세 정보 없음';
+
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: '매물 처리 실패 - ' + new Date().toLocaleString('ko-KR', {timeZone: 'Asia/Seoul'}),
+            labels: ['automation-error', 'property-failure'],
+            body: "**처리 결과:** " + failedCount + "/" + totalCount + "개 실패\n\n" +
+              "**실패 매물 번호:** " + failedProperties + "\n\n" +
+              "**실패 단계별 상세:**\n" + stageDetails
+          })
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Download automation logs on system error
+      if: failure() && steps.workflow_status.outputs.has_system_error == 'true'
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: automation-logs-${{ github.run_number }}
+        path: ./logs
+
+    - name: Extract failure reason from logs
+      if: failure() && steps.workflow_status.outputs.has_system_error == 'true'
+      id: extract_reason
+      continue-on-error: true
+      run: |
+        if [ -f "./logs/automation.log" ]; then
+          if grep -q "❌ 로그인 실패로 자동화 중단" ./logs/automation.log; then
+            echo "failure_type=🔐 로그인 실패" >> $GITHUB_OUTPUT
+            login_url=$(grep "로그인 후 URL:" ./logs/automation.log | tail -1 | sed 's/🔗 로그인 후 URL: //' || echo "URL 확인 불가")
+            echo "failure_details=${login_url}" >> $GITHUB_OUTPUT
+          elif grep -q "❌ 처리할 매물번호가 없습니다" ./logs/automation.log; then
+            echo "failure_type=📋 매물번호 없음" >> $GITHUB_OUTPUT
+            echo "failure_details=환경변수에 매물번호가 설정되지 않음" >> $GITHUB_OUTPUT
+          elif grep -q "❌ 자동화 실행 실패:" ./logs/automation.log; then
+            error_msg=$(grep "❌ 자동화 실행 실패:" ./logs/automation.log | tail -1 | sed 's/❌ 자동화 실행 실패: //')
+            echo "failure_type=⚠️ Python 스크립트 오류" >> $GITHUB_OUTPUT
+            echo "failure_details=${error_msg}" >> $GITHUB_OUTPUT
+          else
+            echo "failure_type=❓ 알 수 없는 오류" >> $GITHUB_OUTPUT
+            echo "failure_details=로그에서 오류 원인을 찾을 수 없음" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "failure_type=📁 로그 파일 없음" >> $GITHUB_OUTPUT
+          echo "failure_details=automation.log 파일을 찾을 수 없음" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create issue on system error
+      if: failure() && steps.workflow_status.outputs.has_system_error == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const failureType = '${{ steps.extract_reason.outputs.failure_type }}' || '❓ 알 수 없는 오류';
+          const failureDetails = '${{ steps.extract_reason.outputs.failure_details }}' || '없음';
+
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: '자동화 실패 - ' + new Date().toLocaleString('ko-KR', {timeZone: 'Asia/Seoul'}),
+            labels: ['automation-error', 'system-error'],
+            body: failureType + "\n\n**실패 원인:** " + failureDetails
+          })
+        github-token: ${{ secrets.GITHUB_TOKEN }}
