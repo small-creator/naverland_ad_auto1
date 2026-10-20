@@ -1,0 +1,7 @@
+{
+  "member_id": "your_naver_id",
+  "ai_partner_login_id": "your_ai_partner_id",
+  "ai_partner_password": "your_ai_partner_password",
+  "github_repository": "https://github.com/username/repository",
+  "github_pat": "ghp_xxxxxxxxxxxxxxxxxxxx"
+}
